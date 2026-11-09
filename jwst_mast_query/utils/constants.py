@@ -52,6 +52,7 @@ PARAM_DEFAULTS = {'mastcolumns_obsTable': ['proposal_id','dataURL','obsid','obs_
                   'outrootdir': None,
                   'outsubdir': None,
                   'clobber': False,
+                  'nprocs': 1,
                   'skip_propID2outsubdir': False,
                   'skip_check_if_outfile_exists': False,
                   'skip_check_filesize': False,

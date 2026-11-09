@@ -1,3 +1,12 @@
+Unreleased
+==========
+
+Downloads
+---------
+
+Added the ``--nprocs`` option to ``jwst_download.py`` (default 1), which downloads several products at the same time with a thread pool. This was prompted by measurements on a link where a single download from MAST reached only ~3.3 MB/s, while eight downloads at the same time reached ~15 MB/s. In the parallel path each file is streamed to ``<filename>.part`` and only renamed to ``<filename>`` once it is complete, and ``makepath()`` is now safe to call from several threads at once. The sequential download is unchanged and remains the default.
+
+
 0.0.6
 =====
 

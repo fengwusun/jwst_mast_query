@@ -45,15 +45,26 @@ def split_commonpath(path1,path2, strip_basenames=False, raiseError=True):
     return(commonpath,not_common)
 
 def makepath(path,raiseError=True):
+    """Create the directory path, doing nothing if it already exists.
+
+    exist_ok=True is used so that several threads (e.g., parallel downloads that
+    write into the same directory) can create the path at the same time without
+    racing each other into a FileExistsError.
+    """
     if path == '':
         return(0)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        if raiseError:
+            raise RuntimeError('ERROR: Cannot create directory %s' % path)
+        else:
+            return(1)
     if not os.path.isdir(path):
-        os.makedirs(path)
-        if not os.path.isdir(path):
-            if raiseError:
-                raise RuntimeError('ERROR: Cannot create directory %s' % path)
-            else:
-                return(1)
+        if raiseError:
+            raise RuntimeError('ERROR: Cannot create directory %s' % path)
+        else:
+            return(1)
     return(0)
 
 def makepath4file(filename,raiseError=True):

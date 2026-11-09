@@ -10,9 +10,13 @@ from astropy.time import Time
 #import numpy as np
 #import pandas as pd
 import astroquery
+import concurrent.futures
 import os,sys,shutil,re
+import time
 #import yaml
 from astropy.utils.data import download_file
+
+import requests
 
 from jwst_mast_query.jwst_query import query_mast
 from jwst_mast_query.pdastro import makepath4file,AnotB
@@ -48,6 +52,77 @@ def rmfile(filename,raiseError=True):
     return(0)
 
 
+# Number of attempts for a single file, and the socket timeout (in seconds) for
+# each attempt. Only used by the parallel downloader.
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_TIMEOUT = 600
+
+
+def download_product_url(url, outfilename, retries=DOWNLOAD_RETRIES, timeout=DOWNLOAD_TIMEOUT):
+    """Download a single product with a request that is local to the calling thread.
+
+    download_mast.download_product() streams the file through the astroquery
+    session, which is shared by all downloads and therefore cannot be used by
+    several threads at the same time. This function uses its own requests
+    session, so that many files can be downloaded in parallel.
+
+    The data are streamed into '<outfilename>.part', which is only renamed to
+    outfilename once the download has finished. An interrupted or failed
+    download therefore never leaves a truncated product behind: a file that is
+    present in the output directory can be trusted to be complete.
+
+    Parameters
+    ----------
+    url : str
+        URL of the product, as given in the MAST product table.
+
+    outfilename : str
+        Name of the file to write.
+
+    retries : int, optional
+        Number of attempts before giving up.
+
+    timeout : float, optional
+        Timeout for each attempt, in seconds.
+
+    Returns
+    -------
+    nbytes : int
+        Number of bytes written.
+    """
+    if outfilename is None:
+        raise ValueError('outfilename is None')
+    if outfilename == '':
+        raise ValueError('outfilename is empty string')
+
+    makepath4file(outfilename)
+
+    tmpfilename = outfilename + '.part'
+    for attempt in range(1, retries + 1):
+        try:
+            nbytes = 0
+            with requests.Session() as session:
+                with session.get(url, stream=True, timeout=timeout) as response:
+                    response.raise_for_status()
+                    with open(tmpfilename, 'wb') as fh:
+                        for chunk in response.iter_content(chunk_size=1 << 20):
+                            fh.write(chunk)
+                            nbytes += len(chunk)
+            os.replace(tmpfilename, outfilename)
+            return(nbytes)
+        except Exception as e:
+            rmfile(tmpfilename, raiseError=False)
+            # Do not retry if the server says that the file is not there.
+            if isinstance(e, requests.HTTPError) and e.response is not None \
+                    and 400 <= e.response.status_code < 500:
+                raise
+            if attempt == retries:
+                raise
+            wait = 5 * attempt
+            print(f'WARNING: download of {outfilename} failed ({e}), retrying in {wait} s')
+            time.sleep(wait)
+
+
 class download_mast(query_mast):
     def __init__(self):
         '''
@@ -71,6 +146,12 @@ class download_mast(query_mast):
 #        parser.add_argument('--outsubdir', default=None, help=('subdir added to the output root directory. If None, then propID is used (default=%(default)s)'))
         parser.add_argument('--clobber', action='store_true', default=PARAM_DEFAULTS['clobber'],
                             help='existing files are overwritten, otherwise they are skipped (default=%(default)s)')
+        parser.add_argument('--nprocs', type=int, default=PARAM_DEFAULTS['nprocs'],
+                            help=('Number of files to download at the same time. The default of 1 '
+                                  'downloads the files one after the other. Larger values download '
+                                  'that many files in parallel, which is much faster if the download '
+                                  'speed of a single file is limited by the server or by the network '
+                                  '(default=%(default)s)'))
 
         return(parser)
 
@@ -190,13 +271,30 @@ class download_mast(query_mast):
                 print('############## Nothing to download!!!!')
                 return(0)
 
+        ixs_download = productTable.ix_sort_by_cols(['proposal_id','obsnum'],indices=ixs_download)
+
+        nprocs = self.params['nprocs'] if self.params['nprocs'] is not None else 1
+        if int(nprocs) > 1:
+            (successcounter,failedcounter) = self.download_products_parallel(productTable, ixs_download, nprocs=int(nprocs))
+        else:
+            (successcounter,failedcounter) = self.download_products_sequential(productTable, ixs_download, clobber=clobber)
+
+        print(f'\n### Download complete: {successcounter} successful, {failedcounter} failed\n###############################')
+        return(0)
+
+    def download_products_sequential(self, productTable, ixs_download, clobber=False):
+        """Download the products in ixs_download one after the other.
+
+        Returns
+        -------
+        successcounter, failedcounter : int, int
+            Number of files that were downloaded, and number of files that failed.
+        """
         counter = 1
         successcounter=0
         failedcounter=0
 
         mastURL = self.JwstObs._portal_api_connection.MAST_DOWNLOAD_URL + "?uri="
-
-        ixs_download = productTable.ix_sort_by_cols(['proposal_id','obsnum'],indices=ixs_download)
 
         for ix in ixs_download:
             print(f'\n### Downloading #{counter} out of {len(ixs_download)} files (status: {successcounter} successful, {failedcounter} failed): {os.path.basename(productTable.t.loc[ix,"outfilename"])}')
@@ -214,5 +312,59 @@ class download_mast(query_mast):
                 failedcounter+=1
             counter+=1
 
-        print(f'\n### Download complete: {successcounter} successful, {failedcounter} failed\n###############################')
-        return(0)
+        return(successcounter,failedcounter)
+
+    def download_products_parallel(self, productTable, ixs_download, nprocs=8):
+        """Download the products in ixs_download with nprocs downloads at the same time.
+
+        Each file is fetched by a worker thread. The product table is only
+        modified by the calling thread, so that the dl_code and dl_str columns
+        end up with the same values as in a sequential download. Files are
+        downloaded to a temporary name and renamed when complete, so there is no
+        need to remove an existing file first when clobbering.
+
+        Returns
+        -------
+        successcounter, failedcounter : int, int
+            Number of files that were downloaded, and number of files that failed.
+        """
+        nprocs = max(int(nprocs),1)
+        nfiles = len(ixs_download)
+
+        mastURL = self.JwstObs._portal_api_connection.MAST_DOWNLOAD_URL + "?uri="
+
+        successcounter=0
+        failedcounter=0
+        nbytes=0
+        ndone=0
+        tstart = Time.now()
+
+        print(f'\n### Downloading {nfiles} files with up to {nprocs} downloads at the same time')
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=nprocs) as executor:
+            futures = {}
+            for ix in ixs_download:
+                url = mastURL + productTable.t.loc[ix,'dataURI']
+                outfilename = productTable.t.loc[ix,'outfilename']
+                futures[executor.submit(download_product_url, url, outfilename)] = ix
+
+            for future in concurrent.futures.as_completed(futures):
+                ix = futures[future]
+                outfilename = productTable.t.loc[ix,'outfilename']
+                ndone+=1
+                try:
+                    nbytes += future.result()
+                except Exception as e:
+                    print(f'ERROR: for file {outfilename}: {str(e)}')
+                    (dl_code,dl_str) = (7,'ERRORdownload')
+                    failedcounter+=1
+                else:
+                    (dl_code,dl_str) = (1,'downloaded')
+                    successcounter+=1
+                productTable.t.loc[ix,'dl_code']=dl_code
+                productTable.t.loc[ix,'dl_str']=dl_str
+
+                dt = max((Time.now()-tstart).to_value('sec'),1e-3)
+                print(f'### Downloading {ndone} out of {nfiles} files (status: {successcounter} successful, {failedcounter} failed, {nbytes/dt/1e6:.2f} MB/s, eta {(nfiles-ndone)*dt/ndone:.0f} s): {os.path.basename(outfilename)}')
+
+        return(successcounter,failedcounter)
