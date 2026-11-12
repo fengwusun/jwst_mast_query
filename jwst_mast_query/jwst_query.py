@@ -630,6 +630,21 @@ class query_mast:
 
         return(mjd_min, mjd_max)
 
+    def _discovery_filters(self, propID, instrument, mjd_min, mjd_max):
+        """Keyword arguments for the astroquery call that lists the
+        ``<instr>/<mode>`` strings present for a program.
+
+        The time filter is omitted when ``mjd_min`` is None: MAST does not
+        populate ``t_min`` for every program, and scoping to the proposal keeps
+        the query small when there is no date constraint.
+        """
+        kwargs = {'instrument_name': f'{instrument}*', 'obs_collection': 'JWST'}
+        if propID is not None:
+            kwargs['proposal_id'] = str(propID)
+        if mjd_min is not None:
+            kwargs['t_min'] = [mjd_min, mjd_max]
+        return kwargs
+
     def observation_query(self, propID=None, instrument=None, mjd_min=None, mjd_max=None, token=None):
         '''
         Perform query for observations matching JWST instrument and program ID
@@ -654,7 +669,10 @@ class query_mast:
         if instrument is None:
             instrument = self.params['instrument']
 
-        print('MJD range:',mjd_min, mjd_max)
+        if mjd_min is None:
+            print(f'MJD range: no lower limit (all dates up to {mjd_max:.2f})')
+        else:
+            print('MJD range:',mjd_min, mjd_max)
 
         # Work-around for MAST update, where instrument name being changed to
         # a string of the format "<instrument>/<mode>" rather than "<instrument>"
@@ -671,8 +689,9 @@ class query_mast:
         # query all modes for the instrument via wildcard
         if self.params['obsmode'][0] is None or len(self.params['obsmode']) == 0:
             print(f'No obsmode given. Querying for all files for {instrument}.')
-            inst_list = list(set(Observations.query_criteria(instrument_name=f'{instrument}*',
-                                                             t_min=[mjd_min, mjd_max])['instrument_name']))
+            inst_list = list(set(Observations.query_criteria(
+                **self._discovery_filters(propID, instrument, mjd_min, mjd_max)
+            )['instrument_name']))
         else:
             initial_inst_list = [f'{instrument.upper()}/{mode.upper()}' for mode in self.params['obsmode']]
             inst_list = deepcopy(initial_inst_list)
@@ -692,8 +711,9 @@ class query_mast:
             # If all of the user-input obsmodes are invalid, then we fall back to using the wildcard
             if len(inst_list) == 0:
                 print('All entered modes are invalid. Falling back to query across all possible obsmodes.')
-                inst_list = list(set(Observations.query_criteria(instrument_name=f'{instrument}*',
-                                                             t_min=[mjd_min, mjd_max])['instrument_name']))
+                inst_list = list(set(Observations.query_criteria(
+                    **self._discovery_filters(propID, instrument, mjd_min, mjd_max)
+                )['instrument_name']))
 
         # If inst_list is empty, then there are no observations to query for
         if len(inst_list) == 0:
@@ -705,9 +725,15 @@ class query_mast:
                   "filters":[
                   {"paramName":"obs_collection","values":["JWST"]},
                   {"paramName":"instrument_name","values":inst_list},
-                  {"paramName":"t_min",
-                    "values":[{"min":mjd_min,"max":mjd_max}]},
                   ]}
+
+        # The t_min filter is only applied when a lower limit was requested.
+        # MAST does not populate t_min for every program (freshly executed ones
+        # can still carry an empty value), and a range filter then silently
+        # drops every observation of that program.
+        if mjd_min is not None:
+            params["filters"].append({"paramName":"t_min",
+                                      "values":[{"min":mjd_min,"max":mjd_max}]})
 
         # Only add propID entry if not None. If it is set to None it doesn't work!
         if propID is not None:
@@ -1234,7 +1260,12 @@ class query_mast:
         if ix_selected_products is None:
             ix_selected_products = self.ix_selected_products
 
-
+        # Nothing selected (e.g. the filetype/obsnum/sca filters removed every
+        # product): return quietly instead of letting pandas raise
+        # "cannot set a frame with no defined index and a scalar".
+        if len(ix_selected_products) == 0:
+            print('WARNING: no products selected; nothing to name or download.')
+            return(ix_selected_products)
 
         productTable.t.loc[ix_selected_products,'outfilename'] = None
         productTable.t.loc[ix_selected_products,'dl_code'] = pd.NA

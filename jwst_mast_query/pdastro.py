@@ -760,9 +760,23 @@ class pdastroclass:
 
         mjdlist = list(self.t.loc[indices,mjdcol])
 
-        dateobjects = Time(mjdlist, format='mjd')
-        dateobs = dateobjects.to_value('isot')
-        self.t.loc[indices,dateobscol]=dateobs
+        # MAST does not always populate the date columns (freshly executed
+        # programs can return an empty/NaN t_min).  Convert only the finite
+        # entries and leave the rest as None, instead of letting astropy raise
+        # "Input values for mjd class must be finite doubles", and never assign
+        # a bare scalar to a possibly empty selection.
+        if len(mjdlist) == 0:
+            return(0)
+        finite = [m for m in mjdlist if m is not None and np.isfinite(m)]
+        out = np.array([None]*len(mjdlist), dtype=object)
+        if len(finite) > 0:
+            dateobs = Time(finite, format='mjd').to_value('isot')
+            k = 0
+            for i, m in enumerate(mjdlist):
+                if m is not None and np.isfinite(m):
+                    out[i] = dateobs[k]
+                    k += 1
+        self.t.loc[indices,dateobscol]=out
 
     def calc_color(self,f1,df1,f2,df2,outcolor=None,outcolor_err_nameformat='e(%s)',indices=None,color_formatter='{:.3f}'.format):
         indices = self.getindices(indices)
